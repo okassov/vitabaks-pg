@@ -1,0 +1,190 @@
+---
+- name: Make sure handlers are flushed immediately
+  ansible.builtin.meta: flush_handlers
+
+- name: Make sure the unzip/tar packages are present
+  ansible.builtin.package:
+    name:
+      - unzip
+      - tar
+    state: present
+  register: package_status
+  until: package_status is success
+  delay: 5
+  retries: 3
+  environment: "{{ proxy_env | default({}) }}"
+  tags: etcd, etcd_install
+
+- block: # install etcd package from repo
+    - name: Download "etcd" package
+      ansible.builtin.get_url:
+        url: "{{ item }}"
+        dest: /tmp/
+        timeout: 60
+        validate_certs: false
+      loop:
+        - "{{ etcd_package_repo }}"
+      environment: "{{ proxy_env | default({}) }}"
+
+    - name: Extract "etcd" into /tmp
+      ansible.builtin.unarchive:
+        src: "/tmp/{{ etcd_package_repo | basename }}"
+        dest: /tmp/
+        extra_opts:
+          - --no-same-owner
+        remote_src: true
+
+    - name: Copy "etcd" and "etcdctl" binary files to /usr/local/bin/
+      ansible.builtin.copy:
+        src: "/tmp/{{ etcd_package_repo.split('.tar.gz')[0] | basename }}/{{ item }}"
+        dest: /usr/local/bin/
+        mode: u+x,g+x,o+x
+        remote_src: true
+      loop:
+        - etcd
+        - etcdctl
+  when:
+    - installation_method == "repo"
+    - etcd_package_repo | length > 0
+    - not ansible_check_mode
+  tags: etcd, etcd_install
+
+- block: # install etcd package from file
+    - name: Extract "etcd" into /tmp
+      ansible.builtin.unarchive:
+        src: "{{ etcd_package_file }}"
+        dest: /tmp/
+        extra_opts:
+          - --no-same-owner
+
+    - name: Copy "etcd" and "etcdctl" binary files to /usr/local/bin/
+      ansible.builtin.copy:
+        src: "/tmp/{{ etcd_package_file.split('.tar.gz')[0] | basename }}/{{ item }}"
+        dest: /usr/local/bin/
+        mode: u+x,g+x,o+x
+        remote_src: true
+      loop:
+        - etcd
+        - etcdctl
+  when:
+    - installation_method == "file"
+    - etcd_package_file | length > 0
+    - not ansible_check_mode
+  tags: etcd, etcd_install
+
+- name: Add etcd user
+  ansible.builtin.user:
+    name: etcd
+    shell: /usr/sbin/nologin
+    home: "{{ etcd_data_dir }}"
+  tags: etcd, etcd_conf
+
+- name: Create etcd conf directory
+  ansible.builtin.file:
+    path: /etc/etcd
+    state: directory
+  tags: etcd, etcd_conf
+
+# TLS
+- block:
+    # if 'etcd_on_dedicated_nodes' is 'false'
+    - name: Copy etcd TLS certificate, key and CA from the master node
+      ansible.builtin.include_role:
+        name: ../roles/tls_certificate/copy
+      vars:
+        tls_group_name: "postgres_cluster"
+        copy_tls_dir: "{{ etcd_tls_dir | default('/etc/etcd/tls') }}"
+        copy_tls_owner: "etcd"
+      when: not etcd_on_dedicated_nodes | default(false) | bool
+
+    # if 'etcd_on_dedicated_nodes' is 'true'
+    - name: Generate etcd TLS certificate
+      ansible.builtin.include_role:
+        name: ../roles/tls_certificate/generate
+      vars:
+        tls_group_name: "etcd_cluster"
+        generate_tls_owner: "etcd"
+        generate_tls_common_name: "etcd"
+        generate_tls_dir: "{{ etcd_tls_dir | default('/etc/etcd/tls') }}"
+        tls_cert_regenerate: "{{ etcd_tls_cert_regenerate | default(false) }}" # Do not generate new certificates if they already exist.
+      when: etcd_on_dedicated_nodes | default(false) | bool
+
+    - name: Copy etcd TLS files to all etcd nodes
+      ansible.builtin.include_role:
+        name: ../roles/tls_certificate/copy
+      vars:
+        tls_group_name: "etcd_cluster"
+        fetch_tls_dir: "{{ etcd_tls_dir | default('/etc/etcd/tls') }}"
+        copy_tls_dir: "{{ etcd_tls_dir | default('/etc/etcd/tls') }}"
+        copy_tls_owner: "etcd"
+      when: etcd_on_dedicated_nodes | default(false) | bool
+  when: tls_cert_generate | default(true) | bool
+  tags: etcd, etcd_conf
+
+- name: Create etcd data directory
+  ansible.builtin.file:
+    path: "{{ etcd_data_dir }}"
+    state: directory
+    owner: etcd
+    mode: "0700"
+  tags: etcd, etcd_conf
+
+- name: Generate conf file "/etc/etcd/etcd.conf"
+  ansible.builtin.template:
+    src: templates/etcd.conf.j2
+    dest: /etc/etcd/etcd.conf
+  tags: etcd, etcd_conf
+
+- name: Copy systemd service file
+  ansible.builtin.template:
+    src: templates/etcd.service.j2
+    dest: /etc/systemd/system/etcd.service
+  tags: etcd, etcd_conf
+
+- name: Enable and start etcd service
+  ansible.builtin.systemd:
+    daemon_reload: true
+    name: etcd
+    enabled: true
+    state: started
+  tags: etcd, etcd_start
+
+- name: Wait for port 2379 to become open on the host
+  ansible.builtin.wait_for:
+    port: 2379
+    host: 127.0.0.1
+    state: started
+    timeout: 120
+    delay: 10
+  ignore_errors: false
+  tags: etcd, etcd_start
+
+- block:
+    - name: Wait until the etcd cluster is healthy
+      ansible.builtin.command: >
+        /usr/local/bin/etcdctl endpoint health
+        --endpoints={{ patroni_etcd_protocol | default('http', true) }}://{{ inventory_hostname }}:2379
+        {% if etcd_tls_enable | default(false) | bool %}
+        --cacert={{ etcd_tls_dir | default('/etc/etcd/tls') }}/{{ etcd_tls_ca_crt | default('ca.crt') }}
+        --cert={{ etcd_tls_dir | default('/etc/etcd/tls') }}/{{ etcd_tls_server_crt | default('server.crt') }}
+        --key={{ etcd_tls_dir | default('/etc/etcd/tls') }}/{{ etcd_tls_server_key | default('server.key') }}
+        {% endif %}
+      environment:
+        ETCDCTL_API: "3"
+      register: etcd_health_result
+      until: >
+        'is healthy' in etcd_health_result.stdout or
+        'is healthy' in etcd_health_result.stderr
+      retries: 10
+      delay: 10
+      changed_when: false
+      ignore_errors: false
+
+    - name: cluster health
+      ansible.builtin.debug:
+        msg: >
+          {{ etcd_health_result.stdout
+          if etcd_health_result.stdout | length > 0
+          else etcd_health_result.stderr }}
+  when: not ansible_check_mode
+  tags: etcd, etcd_start, etcd_status
